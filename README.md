@@ -1,8 +1,14 @@
 # EcoThread
 
+[![CI](https://github.com/IoaBa86/EcoThread/actions/workflows/ci.yml/badge.svg)](https://github.com/IoaBa86/EcoThread/actions/workflows/ci.yml)
+[![Release](https://github.com/IoaBa86/EcoThread/actions/workflows/release.yml/badge.svg)](https://github.com/IoaBa86/EcoThread/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-22e6a8)](LICENSE)
+
 A desktop power and carbon profiler for Windows. Pick one or more running
 processes (or the whole system) and watch estimated wattage, energy use,
 carbon output, and electricity cost update live.
+
+![EcoThread dashboard](assets/screenshot.png)
 
 ## Why
 
