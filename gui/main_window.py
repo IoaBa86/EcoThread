@@ -1,6 +1,8 @@
 """Dashboard window: process picker table, live multi-process watts chart, energy/carbon summary."""
 
 import csv
+import os
+import sys
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -28,14 +30,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core import battery_sensor
+from core import autostart, battery_sensor
 from core.energy_calculator import format_energy
 from core.process_monitor import SYSTEM_WIDE_NAME, SYSTEM_WIDE_PID, ProcessMonitor
+from core.process_scanner import ProcessScanner
 from gui.about_dialog import AboutDialog
 from gui.help_dialog import HelpDialog
 from gui.settings_dialog import SettingsDialog, load_settings, save_settings
 
-CHART_HISTORY_POINTS = 120
 CURVE_PALETTE = ["#22e6a8", "#4fb0ff", "#ffb347", "#ff6b6b", "#c792ea", "#f5d76e", "#63d2ff", "#ff8fb1"]
 
 
@@ -56,7 +58,19 @@ def _metric_card(label_text: str) -> tuple[QFrame, QLabel]:
     return card, value
 
 
+def _asset_path(relative_path: str) -> Path:
+    # PyInstaller unpacks bundled data files under sys._MEIPASS at runtime;
+    # running from source, assets live relative to the project root.
+    base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base_dir / relative_path
+
+
 def _make_app_icon() -> QIcon:
+    icon_path = _asset_path("assets/icon.ico")
+    if icon_path.is_file():
+        return QIcon(str(icon_path))
+
+    # Fallback if the packaged icon is missing: draw a matching placeholder.
     pixmap = QPixmap(64, 64)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
@@ -86,6 +100,7 @@ class MainWindow(QMainWindow):
         self._baseline_watts = 0.0
         self._alerted_this_session = False
         self._process_list_loaded = False
+        self._chart_window_points = self._compute_chart_window_points()
 
         self._build_ui()
         self._build_menu_bar()
@@ -127,10 +142,13 @@ class MainWindow(QMainWindow):
         self._baseline_button.clicked.connect(self._capture_baseline)
         self._export_button = QPushButton("Export CSV")
         self._export_button.clicked.connect(self._export_csv)
+        self._open_sessions_button = QPushButton("Open Sessions Folder")
+        self._open_sessions_button.clicked.connect(self._open_sessions_folder)
         controls_layout.addWidget(self._pause_button)
         controls_layout.addWidget(self._reset_button)
         controls_layout.addWidget(self._baseline_button)
         controls_layout.addWidget(self._export_button)
+        controls_layout.addWidget(self._open_sessions_button)
         controls_layout.addStretch()
         root_layout.addLayout(controls_layout)
 
@@ -222,12 +240,28 @@ class MainWindow(QMainWindow):
             self._settings = dialog.values()
             save_settings(self._settings)
             self._apply_settings_to_monitor()
+            self._apply_autostart(dialog.start_with_windows())
+            self._chart_window_points = self._compute_chart_window_points()
             for entry in self._process_curves.values():
-                entry["time"].clear()
-                entry["watts"].clear()
-                entry["elapsed"] = 0
-                entry["curve"].setData([], [])
+                self._resize_curve_history(entry)
             self._baseline_watts = 0.0
+
+    def _compute_chart_window_points(self) -> int:
+        window_seconds = self._settings.get("chart_window_seconds", 120)
+        poll_seconds = max(self._settings.get("poll_interval_ms", 1000), 1) / 1000.0
+        return max(10, int(window_seconds / poll_seconds))
+
+    def _resize_curve_history(self, entry: dict):
+        entry["time"] = deque(entry["time"], maxlen=self._chart_window_points)
+        entry["watts"] = deque(entry["watts"], maxlen=self._chart_window_points)
+        entry["curve"].setData(list(entry["time"]), list(entry["watts"]))
+
+    def _apply_autostart(self, enabled: bool):
+        try:
+            if autostart.is_enabled() != enabled:
+                autostart.set_enabled(enabled)
+        except OSError:
+            self.statusBar().showMessage("Could not update the Windows startup setting.")
 
     def _open_about_dialog(self):
         AboutDialog(self).exec()
@@ -299,6 +333,22 @@ class MainWindow(QMainWindow):
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(self._session_log)
+            stats = self._compute_session_stats()
+            if stats is not None:
+                csv_file.write(
+                    f"\n# summary: avg={stats['avg_watts']:.2f} W, "
+                    f"peak={stats['peak_watts']:.2f} W, samples={stats['samples']}\n"
+                )
+
+    def _compute_session_stats(self):
+        if not self._session_log:
+            return None
+        watts_values = [row["watts"] for row in self._session_log]
+        return {
+            "avg_watts": sum(watts_values) / len(watts_values),
+            "peak_watts": max(watts_values),
+            "samples": len(watts_values),
+        }
 
     def _save_session_summary(self):
         if not self._session_log:
@@ -311,21 +361,34 @@ class MainWindow(QMainWindow):
         except OSError:
             return
         if self._tray_icon is not None:
+            stats = self._compute_session_stats()
+            stats_text = f" (avg {stats['avg_watts']:.1f} W, peak {stats['peak_watts']:.1f} W)" if stats else ""
             self._tray_icon.showMessage(
-                "EcoThread", f"Session log saved to {file_path}",
+                "EcoThread", f"Session log saved to {file_path}{stats_text}",
                 QSystemTrayIcon.MessageIcon.Information, 4000,
             )
+
+    def _open_sessions_folder(self):
+        sessions_dir = Path.home() / "Documents" / "EcoThread" / "sessions"
+        try:
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            os.startfile(sessions_dir)
+        except OSError:
+            QMessageBox.warning(self, "Open Sessions Folder", "Could not open the sessions folder.")
 
     def _watts_to_display_unit(self, watts: float) -> float:
         return watts * 1000.0 if self._settings["power_units"] == "mW" else watts
 
     def _start_monitor(self):
         self._monitor = ProcessMonitor()
-        self._monitor.process_list_updated.connect(self._on_process_list_updated)
         self._monitor.stats_updated.connect(self._on_stats_updated)
         self._monitor.target_removed.connect(self._on_target_removed)
         self._apply_settings_to_monitor()
         self._monitor.start()
+
+        self._scanner = ProcessScanner()
+        self._scanner.process_list_updated.connect(self._on_process_list_updated)
+        self._scanner.start()
 
     def _on_process_list_updated(self, processes: list):
         self._process_rows = sorted(processes, key=lambda p: p["cpu_percent"], reverse=True)
@@ -419,8 +482,8 @@ class MainWindow(QMainWindow):
         curve = self._plot_widget.plot(pen=pg.mkPen(color=color, width=2), name=legend_name)
         self._process_curves[pid] = {
             "curve": curve,
-            "time": deque(maxlen=CHART_HISTORY_POINTS),
-            "watts": deque(maxlen=CHART_HISTORY_POINTS),
+            "time": deque(maxlen=self._chart_window_points),
+            "watts": deque(maxlen=self._chart_window_points),
             "elapsed": 0,
         }
 
@@ -543,6 +606,7 @@ class MainWindow(QMainWindow):
 
         self._save_session_summary()
         self._monitor.stop()
+        self._scanner.stop()
         if self._tray_icon is not None:
             self._tray_icon.hide()
         super().closeEvent(event)

@@ -9,9 +9,9 @@ env/
 .vscode/
 .idea/
 
-*.spec
 build/
 dist/
+*.pytest_cache/
 
 .DS_Store
 Thumbs.db

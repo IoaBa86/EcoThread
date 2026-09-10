@@ -1,7 +1,8 @@
-"""Settings dialog: TDP/idle/carbon-intensity/poll-interval config and display units."""
+"""Settings dialog: energy model, power profile presets, units, and app behavior."""
 
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -12,6 +13,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from core import autostart
 from core.energy_calculator import ENERGY_UNIT_OPTIONS
 
 ORG_NAME = "EcoThread"
@@ -27,7 +29,26 @@ SETTINGS_DEFAULTS = {
     "power_units": "W",
     "energy_units": "Auto",
     "alert_cost_threshold": 0.0,
+    "chart_window_seconds": 120,
 }
+
+# (package TDP watts, idle baseline watts) per preset.
+POWER_PROFILES = {
+    "Custom": None,
+    "Laptop (15W TDP)": (15.0, 2.0),
+    "Laptop (28W TDP)": (28.0, 3.0),
+    "Desktop (65W TDP)": (65.0, 4.0),
+    "Desktop (125W TDP)": (125.0, 6.0),
+    "Desktop (170W TDP, HEDT)": (170.0, 8.0),
+}
+
+CHART_WINDOW_OPTIONS = [
+    ("1 minute", 60),
+    ("2 minutes", 120),
+    ("5 minutes", 300),
+    ("15 minutes", 900),
+    ("30 minutes", 1800),
+]
 
 
 def load_settings() -> dict:
@@ -45,26 +66,35 @@ def save_settings(values: dict):
 
 
 class SettingsDialog(QDialog):
-    """Modal dialog exposing energy-model parameters and display units."""
+    """Modal dialog exposing energy-model parameters, units, and app behavior."""
 
     def __init__(self, current_values: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(380)
+
+        self._updating_from_profile = False
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
+
+        self._profile_combo = QComboBox()
+        self._profile_combo.addItems(POWER_PROFILES.keys())
+        self._profile_combo.currentTextChanged.connect(self._apply_profile)
+        form.addRow("Power profile", self._profile_combo)
 
         self._tdp_spin = QDoubleSpinBox()
         self._tdp_spin.setRange(1.0, 500.0)
         self._tdp_spin.setSuffix(" W")
         self._tdp_spin.setValue(current_values["tdp_watts"])
+        self._tdp_spin.valueChanged.connect(self._mark_custom_profile)
         form.addRow("Package TDP", self._tdp_spin)
 
         self._idle_spin = QDoubleSpinBox()
         self._idle_spin.setRange(0.0, 100.0)
         self._idle_spin.setSuffix(" W")
         self._idle_spin.setValue(current_values["idle_baseline_watts"])
+        self._idle_spin.valueChanged.connect(self._mark_custom_profile)
         form.addRow("Idle baseline power", self._idle_spin)
 
         self._carbon_spin = QDoubleSpinBox()
@@ -102,12 +132,25 @@ class SettingsDialog(QDialog):
         self._energy_units_combo.setCurrentText(current_values["energy_units"])
         form.addRow("Energy display units", self._energy_units_combo)
 
+        self._chart_window_combo = QComboBox()
+        self._chart_window_combo.addItems([label for label, _ in CHART_WINDOW_OPTIONS])
+        current_seconds = current_values["chart_window_seconds"]
+        for label, seconds in CHART_WINDOW_OPTIONS:
+            if seconds == current_seconds:
+                self._chart_window_combo.setCurrentText(label)
+                break
+        form.addRow("Chart time window", self._chart_window_combo)
+
         self._alert_spin = QDoubleSpinBox()
         self._alert_spin.setRange(0.0, 1000.0)
         self._alert_spin.setDecimals(2)
         self._alert_spin.setSpecialValueText("Disabled")
         self._alert_spin.setValue(current_values["alert_cost_threshold"])
         form.addRow("Cost alert threshold", self._alert_spin)
+
+        self._autostart_check = QCheckBox("Start EcoThread when Windows starts")
+        self._autostart_check.setChecked(autostart.is_enabled())
+        form.addRow("", self._autostart_check)
 
         layout.addLayout(form)
 
@@ -125,7 +168,27 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _apply_profile(self, profile_name: str):
+        preset = POWER_PROFILES.get(profile_name)
+        if preset is None:
+            return
+        tdp_watts, idle_watts = preset
+        self._updating_from_profile = True
+        self._tdp_spin.setValue(tdp_watts)
+        self._idle_spin.setValue(idle_watts)
+        self._updating_from_profile = False
+
+    def _mark_custom_profile(self):
+        if not self._updating_from_profile:
+            self._profile_combo.setCurrentText("Custom")
+
     def values(self) -> dict:
+        chart_window_seconds = SETTINGS_DEFAULTS["chart_window_seconds"]
+        for label, seconds in CHART_WINDOW_OPTIONS:
+            if label == self._chart_window_combo.currentText():
+                chart_window_seconds = seconds
+                break
+
         return {
             "tdp_watts": self._tdp_spin.value(),
             "idle_baseline_watts": self._idle_spin.value(),
@@ -136,4 +199,8 @@ class SettingsDialog(QDialog):
             "power_units": self._units_combo.currentText(),
             "energy_units": self._energy_units_combo.currentText(),
             "alert_cost_threshold": self._alert_spin.value(),
+            "chart_window_seconds": chart_window_seconds,
         }
+
+    def start_with_windows(self) -> bool:
+        return self._autostart_check.isChecked()
