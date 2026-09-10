@@ -1,6 +1,7 @@
 """Dashboard window: process picker table, live multi-process watts chart, energy/carbon summary."""
 
 import csv
+import json
 import os
 import sys
 from collections import deque
@@ -36,7 +37,7 @@ from core.process_monitor import SYSTEM_WIDE_NAME, SYSTEM_WIDE_PID, ProcessMonit
 from core.process_scanner import ProcessScanner
 from gui.about_dialog import AboutDialog
 from gui.help_dialog import HelpDialog
-from gui.settings_dialog import SettingsDialog, load_settings, save_settings
+from gui.settings_dialog import SETTINGS_DEFAULTS, SettingsDialog, load_settings, save_settings
 
 CURVE_PALETTE = ["#22e6a8", "#4fb0ff", "#ffb347", "#ff6b6b", "#c792ea", "#f5d76e", "#63d2ff", "#ff8fb1"]
 
@@ -170,6 +171,14 @@ class MainWindow(QMainWindow):
         chart_layout.addWidget(self._plot_widget)
         root_layout.addWidget(chart_frame, stretch=1)
 
+        self._process_stats_table = QTableWidget(0, 4)
+        self._process_stats_table.setHorizontalHeaderLabels(["Tracked Process", "Current", "Average", "Peak"])
+        self._process_stats_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._process_stats_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._process_stats_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self._process_stats_table.setMaximumHeight(160)
+        root_layout.addWidget(self._process_stats_table)
+
         self._battery_hint_label = QLabel("")
         self._battery_hint_label.setObjectName("metricLabel")
         self._battery_hint_label.setVisible(False)
@@ -195,6 +204,11 @@ class MainWindow(QMainWindow):
         settings_menu = menu_bar.addMenu("&Settings")
         open_settings_action = settings_menu.addAction("Preferences…")
         open_settings_action.triggered.connect(self._open_settings_dialog)
+        settings_menu.addSeparator()
+        export_settings_action = settings_menu.addAction("Export Settings…")
+        export_settings_action.triggered.connect(self._export_settings)
+        import_settings_action = settings_menu.addAction("Import Settings…")
+        import_settings_action.triggered.connect(self._import_settings)
 
         help_menu = menu_bar.addMenu("&Help")
         instructions_action = help_menu.addAction("Instructions")
@@ -237,14 +251,55 @@ class MainWindow(QMainWindow):
     def _open_settings_dialog(self):
         dialog = SettingsDialog(self._settings, self)
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
-            self._settings = dialog.values()
-            save_settings(self._settings)
-            self._apply_settings_to_monitor()
+            self._apply_new_settings(dialog.values())
             self._apply_autostart(dialog.start_with_windows())
-            self._chart_window_points = self._compute_chart_window_points()
-            for entry in self._process_curves.values():
-                self._resize_curve_history(entry)
-            self._baseline_watts = 0.0
+
+    def _apply_new_settings(self, new_settings: dict):
+        self._settings = new_settings
+        save_settings(self._settings)
+        self._apply_settings_to_monitor()
+        self._chart_window_points = self._compute_chart_window_points()
+        for entry in self._process_curves.values():
+            self._resize_curve_history(entry)
+        self._baseline_watts = 0.0
+
+    def _export_settings(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Settings", "ecothread_settings.json", "JSON Files (*.json)",
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", encoding="utf-8") as settings_file:
+                json.dump(self._settings, settings_file, indent=2)
+        except OSError:
+            QMessageBox.warning(self, "Export Settings", "Could not write the settings file.")
+            return
+        self.statusBar().showMessage(f"Settings exported to {file_path}")
+
+    def _import_settings(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Import Settings", "", "JSON Files (*.json)")
+        if not file_path:
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as settings_file:
+                loaded = json.load(settings_file)
+        except (OSError, json.JSONDecodeError):
+            QMessageBox.warning(self, "Import Settings", "Could not read that file as EcoThread settings.")
+            return
+
+        # Only accept known keys, each cast to the type the default uses, so
+        # a malformed or foreign JSON file can't push bad types into the app.
+        merged = dict(self._settings)
+        for key, default in SETTINGS_DEFAULTS.items():
+            if key in loaded:
+                try:
+                    merged[key] = type(default)(loaded[key])
+                except (TypeError, ValueError):
+                    continue
+
+        self._apply_new_settings(merged)
+        self.statusBar().showMessage(f"Settings imported from {file_path}")
 
     def _compute_chart_window_points(self) -> int:
         window_seconds = self._settings.get("chart_window_seconds", 120)
@@ -292,11 +347,15 @@ class MainWindow(QMainWindow):
             entry["time"].clear()
             entry["watts"].clear()
             entry["elapsed"] = 0
+            entry["watt_sum"] = 0.0
+            entry["sample_count"] = 0
+            entry["peak_watts"] = 0.0
             entry["curve"].setData([], [])
         self._latest_stats.clear()
         self._session_log.clear()
         self._baseline_watts = 0.0
         self._alerted_this_session = False
+        self._refresh_process_stats_table()
         self._joules_value.setText("--")
         self._carbon_value.setText("--")
         self._cost_value.setText("--")
@@ -485,6 +544,10 @@ class MainWindow(QMainWindow):
             "time": deque(maxlen=self._chart_window_points),
             "watts": deque(maxlen=self._chart_window_points),
             "elapsed": 0,
+            "display_name": legend_name,
+            "watt_sum": 0.0,
+            "sample_count": 0,
+            "peak_watts": 0.0,
         }
 
     def _untrack_pid(self, pid: int):
@@ -513,6 +576,10 @@ class MainWindow(QMainWindow):
         entry["curve"].setData(list(entry["time"]), list(entry["watts"]))
         self._plot_widget.enableAutoRange(axis="xy", enable=True)
 
+        entry["watt_sum"] += stats["watts"]
+        entry["sample_count"] += 1
+        entry["peak_watts"] = max(entry["peak_watts"], stats["watts"])
+
         self._latest_stats[pid] = stats
 
         self._session_log.append({
@@ -530,7 +597,27 @@ class MainWindow(QMainWindow):
         self._refresh_summary_cards()
         self._check_alert_threshold()
 
+    def _refresh_process_stats_table(self):
+        units = self._settings["power_units"]
+        self._process_stats_table.setRowCount(len(self._process_curves))
+        for row, (pid, entry) in enumerate(self._process_curves.items()):
+            avg_watts = entry["watt_sum"] / entry["sample_count"] if entry["sample_count"] else 0.0
+            current_watts = self._latest_stats.get(pid, {}).get("watts", 0.0)
+
+            self._process_stats_table.setItem(row, 0, QTableWidgetItem(entry["display_name"]))
+            self._process_stats_table.setItem(
+                row, 1, QTableWidgetItem(f"{self._watts_to_display_unit(current_watts):.2f} {units}")
+            )
+            self._process_stats_table.setItem(
+                row, 2, QTableWidgetItem(f"{self._watts_to_display_unit(avg_watts):.2f} {units}")
+            )
+            self._process_stats_table.setItem(
+                row, 3, QTableWidgetItem(f"{self._watts_to_display_unit(entry['peak_watts']):.2f} {units}")
+            )
+
     def _refresh_summary_cards(self):
+        self._refresh_process_stats_table()
+
         if not self._latest_stats:
             self._watts_value.setText("--")
             self._watts_value.setToolTip("")

@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -v
+
+      - name: Build executable
+        run: pyinstaller ecothread.spec --noconfirm
+
+      - name: Zip the build
+        run: powershell Compress-Archive -Path dist/EcoThread.exe -DestinationPath EcoThread-${{ github.ref_name }}-windows.zip
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: EcoThread-${{ github.ref_name }}-windows.zip
+          generate_release_notes: true
