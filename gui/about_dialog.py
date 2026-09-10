@@ -3,7 +3,7 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 ABOUT_TEXT = """
 <h2 style="color:#22e6a8; margin-bottom:0;">EcoThread</h2>
